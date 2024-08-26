@@ -49,6 +49,8 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
+import sys
+
 
 logger = logging.get_logger(__name__)
 
@@ -411,7 +413,7 @@ class LlamaAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
+            torch.cuda.empty_cache()
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -513,6 +515,7 @@ class LlamaFlashAttention2(LlamaAttention):
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
                 )
+            torch.cuda.empty_cache()
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
@@ -633,7 +636,7 @@ class LlamaSdpaAttention(LlamaAttention):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
+            torch.cuda.empty_cache()
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -904,6 +907,9 @@ class LlamaModel(LlamaPreTrainedModel):
         self.post_init()
         self.idx=-1
         self.cnt=0
+        self.init_len=0
+        # self.ll=[2681, 1703, 1652, 1737, 596, 1412, 2837, 615, 1789, 1864, 2992, 1561, 788, 2997, 953, 6391, 2837, 832, 1592, 5940, 862, 5628]
+        # self.lr=[440, 489, 436, 401, 350, 374, 446, 345, 455, 511, 355, 459, 356, 432, 472, 511, 469, 303, 400, 388, 329, 511]
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -927,11 +933,21 @@ class LlamaModel(LlamaPreTrainedModel):
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         seq_len=input_ids.shape[1]
         if seq_len>1:
+            # if self.idx>=0:
+            #     print(f'\n### IDX={self.idx}, {self.init_len} + {self.cnt}\n')
+                # self.ll.append(self.init_len)
+                # self.lr.append(self.cnt)
+            self.init_len=seq_len
             self.cnt=0
             self.idx+=1
         else:
             self.cnt+=1
-        print(f'\n### IDX={self.idx}, CNT={self.cnt}, LEN={seq_len}\n')
+        # print(f'\n### IDX={self.idx}, CNT={self.cnt}, LEN={seq_len}, INIT={self.init_len}\n')
+        # if self.idx>=11:
+        #     sys.exit(0)
+        # if self.cnt == self.lr[self.idx]:
+        #     past_key_values.save_self(self.idx)
+        #     torch.cuda.empty_cache()
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

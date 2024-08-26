@@ -27,17 +27,33 @@ def rm(l,idx):
     l.insert(idx,-1)
     torch.cuda.empty_cache()
     
+def restore_token(x_l: torch.Tensor, x_l_1: torch.Tensor, omega: torch.Tensor, gamma: float = 0.05):
+    d_min = omega.min().item()
+    d_max = omega.max().item()
+    th = d_min+(d_max-d_min)*gamma
+    indices = (omega<th)
+    return indices, x_l[:,:,indices], x_l_1[:,:,indices], th
+
 def minicache_merge(x_l:torch.Tensor, x_l_1:torch.Tensor, t=0.6):
     # x_l=[bs=1, 8, seq_len, 1024]
     seq_len=x_l.shape[2]
-    x_l=x_l.squeeze().permute([1,0,2]).contiguous().view(seq_len,-1)
-    x_l_1=x_l_1.squeeze().permute([1,0,2]).contiguous().view([seq_len,1024])
+    x_l=x_l.squeeze(0).permute([1,0,2]).contiguous().view([seq_len,1024])
+    x_l_1=x_l_1.squeeze(0).permute([1,0,2]).contiguous().view([seq_len,1024])
     # x_l=[seq_len, 1024]
-    n_l=torch.norm(x_l, p=2, dim=1)
-    n_l_1=torch.norm(x_l_1, p=2, dim=1)
+    n_l=torch.norm(x_l, p=2, dim=1).unsqueeze(1)
+    n_l_1=torch.norm(x_l_1, p=2, dim=1).unsqueeze(1)
     omega=(torch.nn.functional.cosine_similarity(x_l,x_l_1,dim=1)).arccos_()
-    e=((1-t)*omega).sin().view(-1,1) * x_l + (t*omega).sin().view(-1,1) * x_l_1
+    e=((1-t)*omega).sin().view(-1,1) * (x_l / n_l) + (t*omega).sin().view(-1,1) * (x_l_1 / n_l_1)
     e/=omega.sin().view(-1,1)
+    # n_e = torch.norm(e, p=2, dim=1).unsqueeze(1)
+    # e/=n_e
+    # e=e.view([1,8,seq_len,128])
+    e=e.view([seq_len,8,128]).permute([1,0,2]).unsqueeze(0)
+    x_l=x_l.view([seq_len,8,128]).permute([1,0,2]).unsqueeze(0)
+    x_l_1=x_l_1.view([seq_len,8,128]).permute([1,0,2]).unsqueeze(0)
+    if seq_len>1:
+        indices, r_l, r_l_1, th = restore_token(x_l,x_l_1,omega)
+        return e, n_l, n_l_1, indices, r_l, r_l_1, th
     return e, n_l, n_l_1, omega
 
 class Cache(torch.nn.Module):
@@ -339,8 +355,19 @@ class DynamicCache(Cache):
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
-        # self.key_devices: List[torch.device] = []
-        # self.value_devices: List[torch.device] = []
+
+        self.e_k: List[torch.Tensor] = [] # 8=[0,8)
+        self.e_v: List[torch.Tensor] = [] # 8*[1,8,seq_len,128]
+        self.n_k: List[torch.Tensor] = [] # 16=[0,16)
+        self.n_v: List[torch.Tensor] = [] # 16*[seq_len,1]
+        self.indices_k: List[torch.Tensor] = [] # 8=[0,8)
+        self.indices_v: List[torch.Tensor] = [] # 8*[seq_len]
+        self.r_k: List[torch.Tensor] = [] # 16=[0,16)
+        self.r_v: List[torch.Tensor] = [] # 16*[1,8,ret_len,128]
+        self.th_k: List[float] = [] # 8=[0,8)
+        self.th_v: List[float] = [] # 8*float
+        self.tmp_k: torch.Tensor = None
+        self.tmp_v: torch.Tensor = None # [1,8,1,128]
 
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
@@ -367,6 +394,18 @@ class DynamicCache(Cache):
         """
         return len(self.key_cache)
 
+    def save_self(self,idx=-1):
+        if idx<0:
+            print('Error')
+        print(f'\n###\nsaving {idx}\n###\n')
+        device='cuda:0'
+        k = torch.stack([t.to(device) for t in self.key_cache])
+        v = torch.stack([t.to(device) for t in self.value_cache])
+        pk=f'/new_data/yanghq/data/pt/k_{idx}.pt'
+        pv=f'/new_data/yanghq/data/pt/v_{idx}.pt'
+        torch.save(k, pk)
+        torch.save(v, pv)
+        
     def mean_update(
         self,
         key_states: torch.Tensor,
@@ -383,17 +422,15 @@ class DynamicCache(Cache):
                 self.value_cache.append(value_states)
             else:
                 if layer_idx%2==1:
-                    # 17: merge&->cache[17], rm cache[16]
+                    # 17: merge(16,17)->cache[17], rm cache[16]
                     self.key_cache.append((self.key_cache[layer_idx-1]+key_states)/2)
                     rm(self.key_cache,layer_idx-1)
                     self.value_cache.append((self.value_cache[layer_idx-1]+value_states)/2)
                     rm(self.value_cache,layer_idx-1)
                 else:
-                    # 16: pass
-                    pass
-        # if layer_idx==31:
-        #     for i in range(32):
-        #         print(',',i,type(self.key_cache[i]), type(self.value_cache[i]))
+                    # 16: cache[16]
+                    self.key_cache.append(key_states)
+                    self.value_cache.append(value_states)
         else:
             if layer_idx <=15:
                 self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
@@ -401,13 +438,15 @@ class DynamicCache(Cache):
             else:
                 if layer_idx%2==1:
                     # 17: merge(t[17], t[16]) ->[17]->return
-                    self.key_cache[layer_idx][:,:,-1]=(self.key_cache[layer_idx][:,:,-1]+key_states)/2
-                    self.value_cache[layer_idx][:,:,-1]=(self.value_cache[layer_idx][:,:,-1]+value_states)/2
+                    self.key_cache[layer_idx][:,:,-1:]=(self.key_cache[layer_idx][:,:,-1:]+key_states)/2
+                    self.value_cache[layer_idx][:,:,-1:]=(self.value_cache[layer_idx][:,:,-1:]+value_states)/2
                 else:
                     # 16: cat(past[17], t[16]) ->[17]->return
                     self.key_cache[layer_idx+1] = torch.cat([self.key_cache[layer_idx+1], key_states], dim=-2)
                     self.value_cache[layer_idx+1] = torch.cat([self.value_cache[layer_idx+1], value_states], dim=-2)
-        
+        torch.cuda.empty_cache()
+        if len(self.key_cache)<32:
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
         if layer_idx>15 and layer_idx%2==0:
             return self.key_cache[layer_idx+1], self.value_cache[layer_idx+1]
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
@@ -422,14 +461,101 @@ class DynamicCache(Cache):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
-            
         if len(self.key_cache) <= layer_idx:
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
+            if layer_idx <= 15:
+                self.key_cache.append(key_states)
+                self.value_cache.append(value_states)
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+            elif layer_idx%2==0:
+                # prefill[16]
+                self.key_cache.append(key_states)
+                self.value_cache.append(value_states)
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+            else:
+                # prefill[17]
+                self.key_cache.append(-1)
+                self.value_cache.append(-1)
+                
+                e, n_l, n_l_1, indices, r_l, r_l_1, th  = minicache_merge(
+                    key_states, self.key_cache[layer_idx-1])
+                self.e_k.append(e)
+                self.n_k.append(n_l_1)
+                self.n_k.append(n_l)
+                self.indices_k.append(indices)
+                self.r_k.append(r_l_1)
+                self.r_k.append(r_l)
+                self.th_k.append(th)
+                rm(self.key_cache, layer_idx-1)
+                
+                e, n_l, n_l_1, indices, r_l, r_l_1, th  = minicache_merge(
+                    value_states, self.value_cache[layer_idx-1])
+                self.e_v.append(e)
+                self.n_v.append(n_l_1)
+                self.n_v.append(n_l)
+                self.indices_v.append(indices)
+                self.r_v.append(r_l_1)
+                self.r_v.append(r_l)
+                self.th_v.append(th)
+                rm(self.value_cache, layer_idx-1)
+                
+                k = self.e_k[(layer_idx-16)//2] * self.n_k[layer_idx-16]
+                k[:,:,self.indices_k[(layer_idx-16)//2]] = self.r_k[layer_idx-16]
+                v = self.e_v[(layer_idx-16)//2] * self.n_v[layer_idx-16]
+                v[:,:,self.indices_v[(layer_idx-16)//2]] = self.r_v[layer_idx-16]
+                
+                return k,v
         else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
-
+            if layer_idx <= 15:
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+            elif layer_idx%2==0:
+                # decoding[16]
+                k = self.e_k[(layer_idx-16)//2] * self.n_k[layer_idx-16]
+                k[:,:,self.indices_k[(layer_idx-16)//2]] = self.r_k[layer_idx-16]
+                v = self.e_v[(layer_idx-16)//2] * self.n_v[layer_idx-16]
+                v[:,:,self.indices_v[(layer_idx-16)//2]] = self.r_v[layer_idx-16]
+                k=torch.cat([k,key_states],dim=-2)
+                v=torch.cat([v,value_states],dim=-2)
+                self.tmp_k=key_states
+                self.tmp_v=value_states
+                return k,v
+            else:
+                # decoding[17]
+                e, n_l, n_l_1, omega = minicache_merge(key_states, self.tmp_k)
+                self.indices_k[(layer_idx-16)//2] = torch.cat(
+                    [self.indices_k[(layer_idx-16)//2], omega<self.th_k[(layer_idx-16)//2]])
+                if omega<self.th_k[(layer_idx-16)//2]:
+                    self.r_k[layer_idx-16] = torch.cat([self.r_k[layer_idx-16], key_states], dim=-2)
+                    self.r_k[layer_idx-16-1] = torch.cat([self.r_k[layer_idx-16-1], self.tmp_k], dim=-2)
+                self.e_k[(layer_idx-16)//2]=torch.cat(
+                    [self.e_k[(layer_idx-16)//2], e], dim=2)
+                self.n_k[layer_idx-16-1]=torch.cat(
+                    [self.n_k[layer_idx-16-1], n_l_1], dim=0)
+                self.n_k[layer_idx-16]=torch.cat(
+                    [self.n_k[layer_idx-16], n_l], dim=0)
+                
+                e, n_l, n_l_1, omega = minicache_merge(value_states, self.tmp_v)
+                self.indices_v[(layer_idx-16)//2] = torch.cat(
+                    [self.indices_v[(layer_idx-16)//2], omega<self.th_v[(layer_idx-16)//2]])
+                if omega<self.th_v[(layer_idx-16)//2]:
+                    self.r_v[layer_idx-16] = torch.cat([self.r_v[layer_idx-16], value_states], dim=-2)
+                    self.r_v[layer_idx-16-1] = torch.cat([self.r_v[layer_idx-16-1], self.tmp_v], dim=-2)
+                self.e_v[(layer_idx-16)//2]=torch.cat(
+                    [self.e_v[(layer_idx-16)//2], e], dim=2)
+                self.n_v[layer_idx-16-1]=torch.cat(
+                    [self.n_v[layer_idx-16-1], n_l_1], dim=0)
+                self.n_v[layer_idx-16]=torch.cat(
+                    [self.n_v[layer_idx-16], n_l], dim=0)
+                
+                k = self.e_k[(layer_idx-16)//2] * self.n_k[layer_idx-16]
+                v = self.e_v[(layer_idx-16)//2] * self.n_v[layer_idx-16]
+                k[:,:,self.indices_k[(layer_idx-16)//2]] = self.r_k[layer_idx-16]
+                v[:,:,self.indices_v[(layer_idx-16)//2]] = self.r_v[layer_idx-16]
+                
+                return k,v
+        for i in range(10):
+            print('wtfwtfwtfwtfwtf')
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
         
     def update(
@@ -439,7 +565,7 @@ class DynamicCache(Cache):
         layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.mean_update(key_states, value_states, layer_idx, cache_kwargs)
+        # return self.mean_update(key_states, value_states, layer_idx, cache_kwargs)
         return self.minicache_update(key_states, value_states, layer_idx, cache_kwargs)
         """
         Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
