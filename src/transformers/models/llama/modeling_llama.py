@@ -668,7 +668,12 @@ class LlamaSdpaAttention(LlamaAttention):
         attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
-
+        if self.layer_idx >=16 and self.layer_idx%2==1:
+            idx = (self.layer_idx-16)//2
+            if q_len > 1:
+                past_key_value.merger[idx].merge_prefill()
+            else:
+                past_key_value.merger[idx].merge_decode()
         return attn_output, None, past_key_value
 
 
