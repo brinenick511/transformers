@@ -370,7 +370,7 @@ class LlamaAttention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
+        print('ori_attn')
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
@@ -668,12 +668,12 @@ class LlamaSdpaAttention(LlamaAttention):
         attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
-        if self.layer_idx >=16 and self.layer_idx%2==1:
-            idx = (self.layer_idx-16)//2
-            if q_len > 1:
-                past_key_value.merger[idx].merge_prefill()
-            else:
-                past_key_value.merger[idx].merge_decode()
+        # if self.layer_idx >=16 and self.layer_idx%2==1:
+        #     idx = (self.layer_idx-16)//2
+        #     if q_len > 1:
+        #         past_key_value.merger[idx].merge_prefill()
+        #     else:
+        #         past_key_value.merger[idx].merge_decode()
         return attn_output, None, past_key_value
 
 

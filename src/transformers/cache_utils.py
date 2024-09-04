@@ -554,7 +554,7 @@ class DynamicCache(Cache):
         layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.minicache_update(key_states, value_states, layer_idx, cache_kwargs)
+        # return self.minicache_update(key_states, value_states, layer_idx, cache_kwargs)
         """
         Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
 
