@@ -488,12 +488,17 @@ class MistralSdpaAttention(MistralAttention):
 
         attn_output = self.o_proj(attn_output)
 
+        ## ADDED
         if self.layer_idx >=16 and self.layer_idx%2==1:
             idx = (self.layer_idx-16)//2
             if q_len > 1:
-                past_key_value.merger[idx].merge_prefill()
+                past_key_value.k_merger[idx].merge_prefill()
+                past_key_value.v_merger[idx].merge_prefill()
             else:
-                past_key_value.merger[idx].merge_decode()
+                past_key_value.k_merger[idx].merge_decoding()
+                past_key_value.v_merger[idx].merge_decoding()
+        ## ADDED
+        
         return attn_output, None, past_key_value
 
 
