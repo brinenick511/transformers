@@ -489,14 +489,20 @@ class MistralSdpaAttention(MistralAttention):
         attn_output = self.o_proj(attn_output)
 
         ## ADDED
-        if self.layer_idx >=16 and self.layer_idx%2==1:
-            idx = (self.layer_idx-16)//2
-            if q_len > 1:
-                past_key_value.k_merger[idx].merge_prefill()
-                past_key_value.v_merger[idx].merge_prefill()
-            else:
-                past_key_value.k_merger[idx].merge_decoding()
-                past_key_value.v_merger[idx].merge_decoding()
+        # if self.layer_idx >=16 and self.layer_idx%2==1:
+        #     idx = (self.layer_idx-16)//2
+        #     if past_key_value.k_merger[idx].pre[0] is not None:
+        #         if q_len > 1:
+        #             past_key_value.k_merger[idx].merge_prefill()
+        #             past_key_value.v_merger[idx].merge_prefill()
+        #             # past_key_value._quantized_key_cache[self.layer_idx] = past_key_value.k_merger[idx].get(self.layer_idx)
+        #             # past_key_value._quantized_value_cache[self.layer_idx] = past_key_value.v_merger[idx].get(self.layer_idx)
+        #             # past_key_value._quantized_key_cache[self.layer_idx-1] = past_key_value.k_merger[idx].get(self.layer_idx-1)
+        #             # past_key_value._quantized_value_cache[self.layer_idx-1] = past_key_value.v_merger[idx].get(self.layer_idx-1)
+        #         else:
+        #             pass
+        #             # past_key_value.k_merger[idx].merge_decoding()
+        #             # past_key_value.v_merger[idx].merge_decoding()
         ## ADDED
         
         return attn_output, None, past_key_value
